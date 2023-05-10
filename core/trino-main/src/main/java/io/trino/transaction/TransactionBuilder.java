@@ -16,7 +16,15 @@ package io.trino.transaction;
 import io.trino.Session;
 import io.trino.security.AccessControl;
 import io.trino.spi.transaction.IsolationLevel;
+import io.trino.spi.session.SessionConfigurationContext;
+import io.trino.spi.transaction.TransactionId;
+import io.trino.spi.transaction.TransactionInfo;
+import io.trino.spi.transaction.TransactionManager;
+import io.trino.spi.transaction.TransactionalSession;
 
+import javax.inject.Inject;
+
+import java.util.Optional;
 import java.util.function.Consumer;
 import java.util.function.Function;
 
@@ -24,141 +32,59 @@ import static com.google.common.base.Preconditions.checkState;
 import static io.airlift.concurrent.MoreFutures.getFutureValue;
 import static java.util.Objects.requireNonNull;
 
-public class TransactionBuilder
-{
-    private final TransactionManager transactionManager;
-    private final AccessControl accessControl;
+public class TransactionBuilder {
+
     private IsolationLevel isolationLevel = TransactionManager.DEFAULT_ISOLATION;
     private boolean readOnly = TransactionManager.DEFAULT_READ_ONLY;
     private boolean singleStatement;
 
-    private TransactionBuilder(TransactionManager transactionManager, AccessControl accessControl)
-    {
+    @Inject
+    public TransactionBuilder(TransactionExecutor transactionExecutor) {
+        this.transactionExecutor = transactionExecutor;
+    }
+
+    public <T> T executeTransaction(SessionConfigurationContext sessionContext, IsolationLevel isolationLevel,
+                                     boolean readOnly, Function<TransactionalSession, T> callback) {
+        return transactionExecutor.executeTransaction(sessionContext, isolationLevel, readOnly, callback);
+    }
+
+    public void executeTransaction(SessionConfigurationContext sessionContext, IsolationLevel isolationLevel,
+                                    boolean readOnly, Consumer<TransactionalSession> callback) {
+        transactionExecutor.executeTransaction(sessionContext, isolationLevel, readOnly, (TransactionalSession session) -> {
+            callback.accept(session);
+            return null;
+        });
+    }
+}
+public class TransactionExecutor {
+    private final TransactionManager transactionManager;
+    private final AccessControl accessControl;
+
+    @Inject
+    public TransactionExecutor(TransactionManager transactionManager, AccessControl accessControl) {
         this.transactionManager = requireNonNull(transactionManager, "transactionManager is null");
         this.accessControl = requireNonNull(accessControl, "accessControl is null");
     }
 
-    public static TransactionBuilder transaction(TransactionManager transactionManager, AccessControl accessControl)
-    {
-        return new TransactionBuilder(transactionManager, accessControl);
-    }
-
-    public TransactionBuilder withIsolationLevel(IsolationLevel isolationLevel)
-    {
-        this.isolationLevel = requireNonNull(isolationLevel, "isolationLevel is null");
-        return this;
-    }
-
-    public TransactionBuilder readUncommitted()
-    {
-        return withIsolationLevel(IsolationLevel.READ_UNCOMMITTED);
-    }
-
-    public TransactionBuilder readCommitted()
-    {
-        return withIsolationLevel(IsolationLevel.READ_COMMITTED);
-    }
-
-    public TransactionBuilder repeatableRead()
-    {
-        return withIsolationLevel(IsolationLevel.REPEATABLE_READ);
-    }
-
-    public TransactionBuilder serializable()
-    {
-        return withIsolationLevel(IsolationLevel.SERIALIZABLE);
-    }
-
-    public TransactionBuilder readOnly()
-    {
-        readOnly = true;
-        return this;
-    }
-
-    public TransactionBuilder singleStatement()
-    {
-        singleStatement = true;
-        return this;
-    }
-
-    public void execute(Consumer<TransactionId> callback)
-    {
+    public <T> T executeTransaction(SessionConfigurationContext sessionContext, IsolationLevel isolationLevel,
+                                     boolean readOnly, Function<TransactionalSession, T> callback) {
+        requireNonNull(sessionContext, "sessionContext is null");
         requireNonNull(callback, "callback is null");
 
-        execute(transactionId -> {
-            callback.accept(transactionId);
-            return null;
-        });
-    }
-
-    public <T> T execute(Function<TransactionId, T> callback)
-    {
-        requireNonNull(callback, "callback is null");
-
-        TransactionId transactionId = transactionManager.beginTransaction(isolationLevel, readOnly, singleStatement);
+        TransactionId transactionId = transactionManager.beginTransaction(isolationLevel, readOnly, false);
 
         boolean success = false;
         try {
-            T result = callback.apply(transactionId);
-            success = true;
-            return result;
-        }
-        finally {
-            if (success) {
-                getFutureValue(transactionManager.asyncCommit(transactionId));
-            }
-            else {
-                transactionManager.asyncAbort(transactionId);
-            }
-        }
-    }
-
-    public void execute(Session session, Consumer<Session> callback)
-    {
-        requireNonNull(session, "session is null");
-        requireNonNull(callback, "callback is null");
-
-        execute(session, transactionSession -> {
-            callback.accept(transactionSession);
-            return null;
-        });
-    }
-
-    public <T> T execute(Session session, Function<Session, T> callback)
-    {
-        requireNonNull(session, "session is null");
-        requireNonNull(callback, "callback is null");
-
-        boolean managedTransaction = session.getTransactionId().isEmpty();
-
-        Session transactionSession;
-        if (managedTransaction) {
-            TransactionId transactionId = transactionManager.beginTransaction(isolationLevel, readOnly, singleStatement);
-            transactionSession = session.beginTransactionId(transactionId, transactionManager, accessControl);
-        }
-        else {
-            // Check if we can merge with the existing transaction
-            TransactionInfo transactionInfo = transactionManager.getTransactionInfo(session.getTransactionId().get());
-            checkState(transactionInfo.getIsolationLevel().meetsRequirementOf(isolationLevel), "Cannot provide %s isolation with existing transaction isolation: %s", isolationLevel, transactionInfo.getIsolationLevel());
-            checkState(!transactionInfo.isReadOnly() || readOnly, "Cannot provide read-write semantics with existing read-only transaction");
-            checkState(!transactionInfo.isAutoCommitContext() && !singleStatement, "Cannot combine auto commit transactions");
-            transactionSession = session;
-        }
-
-        boolean success = false;
-        try {
+            Optional<TransactionInfo> transactionInfo = transactionManager.getTransactionInfo(transactionId);
+            TransactionalSession transactionSession = new TransactionalSession(sessionContext, transactionId, transactionManager, accessControl, transactionInfo.get(), false);
             T result = callback.apply(transactionSession);
             success = true;
             return result;
-        }
-        finally {
-            if (managedTransaction && transactionManager.transactionExists(transactionSession.getTransactionId().get())) {
-                if (success) {
-                    getFutureValue(transactionManager.asyncCommit(transactionSession.getTransactionId().get()));
-                }
-                else {
-                    transactionManager.asyncAbort(transactionSession.getTransactionId().get());
-                }
+        } finally {
+            if (success) {
+                getFutureValue(transactionManager.asyncCommit(transactionId));
+            } else {
+                transactionManager.asyncAbort(transactionId);
             }
         }
     }
